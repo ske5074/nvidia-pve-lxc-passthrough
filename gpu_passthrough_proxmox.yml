@@ -1,0 +1,121 @@
+- name: GPU Passthrough Setup on Proxmox
+  hosts: proxmox
+  become: true
+  vars:
+    nvidia_driver_url: "https://us.download.nvidia.com/XFree86/Linux-x86_64/570.133.07/NVIDIA-Linux-x86_64-570.133.07.run"
+    nvidia_driver_filename: "NVIDIA-Linux-x86_64-570.133.07.run"
+    nvidia_driver_dest: "/root/{{ nvidia_driver_filename }}"
+
+  tasks:
+
+    - name: Install pciutils for hardware detection
+      apt:
+        name: pciutils
+        state: present
+        update_cache: true
+
+    - name: Check for NVIDIA GPU
+      shell: lspci | grep -i vga | grep -i nvidia
+      register: nvidia_gpu_check
+      changed_when: false
+      failed_when: nvidia_gpu_check.stdout == ""
+
+    - name: Check if nvidia-smi -L works
+      command: nvidia-smi -L
+      register: nvidia_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Skip host if NVIDIA driver is already working
+      meta: end_host
+      when: nvidia_check.rc == 0
+
+    - name: Install required packages
+      apt:
+        name:
+          - pve-headers
+          - dkms
+          - wget
+        state: present
+        update_cache: true
+
+    - name: Update GRUB for IOMMU
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX_DEFAULT='
+        line: 'GRUB_CMDLINE_LINUX_DEFAULT="quiet intel_iommu=on iommu=pt"'
+
+    - name: Update GRUB config
+      command: update-grub2
+
+    - name: Blacklist default GPU drivers
+      blockinfile:
+        path: /etc/modprobe.d/blacklist.conf
+        block: |
+          blacklist nvidia
+          blacklist nouveau
+          blacklist radeon
+
+    - name: Add VFIO modules to /etc/modules
+      blockinfile:
+        path: /etc/modules
+        block: |
+          vfio
+          vfio_iommu_type1
+          vfio_pci
+          vfio_virqfd
+
+    - name: Update initramfs
+      command: update-initramfs -u -k all
+
+    - name: Reboot Proxmox server
+      reboot:
+        msg: "Rebooting to apply GPU passthrough settings"
+        pre_reboot_delay: 5
+        reboot_timeout: 600
+
+    - name: Get list of installed NVIDIA or CUDA packages
+      shell: |
+        apt list --installed | egrep -i "nvidia|cuda" | cut -d/ -f1
+      register: nvidia_packages
+      changed_when: false
+      when: nvidia_check.rc != 0
+
+    - name: Remove old NVIDIA/CUDA packages (if any)
+      apt:
+        name: "{{ nvidia_packages.stdout_lines }}"
+        state: absent
+        purge: true
+        autoremove: true
+      when: nvidia_packages.stdout != "" and nvidia_check.rc != 0
+
+    - name: Download NVIDIA Driver
+      get_url:
+        url: "{{ nvidia_driver_url }}"
+        dest: "{{ nvidia_driver_dest }}"
+        mode: '0755'
+      when: nvidia_check.rc != 0
+
+    - name: Run NVIDIA Driver Installer (non-interactive)
+      command: "{{ nvidia_driver_dest }} --silent"
+      when: nvidia_check.rc != 0
+
+    - name: Run nvidia-smi -L to list available GPUs
+      command: nvidia-smi -L
+      register: nvidia_smi_output
+      changed_when: false
+      failed_when: nvidia_smi_output.rc != 0 or nvidia_smi_output.stdout is not search("GPU [0-9]+:")
+
+    - name: Show detected GPU(s)
+      debug:
+        msg: "{{ nvidia_smi_output.stdout }}"
+
+    - name: Generate LXC GPU device permissions
+      shell: |
+        for conf in /etc/pve/lxc/*.conf; do
+          while read major minor; do
+            echo "lxc.cgroup2.devices.allow: c ${major}:${minor} rwm" >> "$conf"
+          done < <(ls -al /dev/nvidia* | awk '{print $5, $6}' | grep '^[0-9]')
+        done
+      args:
+        executable: /bin/bash
