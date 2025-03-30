@@ -1,5 +1,5 @@
-# ansible-nvidia-pve-lxc-passthrough
-
+# Ansible NVIDIA Proxmox - LXC GPU Passthrough for Docker GPU support.
+ 
 Ansible playbook to automate NVIDIA GPU passthrough on Proxmox VE (PVE) nodes for use within LXC containers. This playbook:
 
 - Detects NVIDIA GPUs
